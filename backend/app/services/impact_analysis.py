@@ -11,6 +11,13 @@ from app.services.base import BaseModuleService
 from app.store import store
 
 
+def _issue_service():
+    # 延迟导入：影响分析与问题追踪通过「派发」接口协作，而不是共享写单逻辑。
+    from app.services.issue_track import IssueTrackService
+
+    return IssueTrackService()
+
+
 class ImpactAnalysisService(BaseModuleService):
     MODULE = "impact_analysis"
     ENTITY = "影响报告"
@@ -51,9 +58,10 @@ class ImpactAnalysisService(BaseModuleService):
         }
         store.rows(self.MODULE).append(report)
 
-        # 如果严重级别高，创建治理问题
+        # 如果严重级别高，把有效范围交给问题追踪派发工单
+        dispatch = None
         if severity == "严重":
-            self._create_impact_issue(report, asset_code, downstream)
+            dispatch = self._dispatch_impact(report, asset_code, downstream)
 
         store.log_change(
             self.MODULE, report_id, "影响分析",
@@ -68,12 +76,16 @@ class ImpactAnalysisService(BaseModuleService):
             "severity": severity,
         })
 
-        return {
+        result = {
             "report": report,
             "downstream": downstream,
             "severity": severity,
             "pipeline": "lineage_track->impact_analysis",
         }
+        if dispatch is not None:
+            result["issue"] = dispatch["issue"]
+            result["dispatch"] = dispatch
+        return result
 
     def _generate_remedy(self, change_type: str, downstream: list[str]) -> str:
         """生成补救建议。"""
@@ -86,26 +98,44 @@ class ImpactAnalysisService(BaseModuleService):
             return f"上游删除操作影响{count}个下游资产，建议先备份现有数据再执行，并通知各下游调整数据消费逻辑"
         return f"上游变更影响{count}个下游资产，建议逐项评估影响后有序推进"
 
-    def _create_impact_issue(self, report: dict[str, Any], asset_code: str, downstream: list[str]) -> None:
-        """创建治理问题追踪。"""
-        issue_id = store.next_id("issue_track")
-        issue = {
-            "id": issue_id,
-            "问题编号": f"ISSU-IMP-{issue_id:04d}",
-            "关联资产": asset_code,
-            "问题类型": "影响范围过大",
-            "严重级别": "严重",
-            "指派处理": "数据架构师",
-            "当前状态": "待评估",
-            "修复方案": f"上游{asset_code}变更影响{len(downstream)}个下游，需逐项评估",
-            "截止日期": _time.strftime("%Y-%m-%d", _time.localtime(_time.time() + 86400 * 5)),
-            "status": "待确认",
-            "pending": True,
-            "abnormal": True,
-            "impact_report_id": report["id"],
-            "created_at": _time.strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        store.rows("issue_track").append(issue)
+    def _create_impact_issue(self, report: dict[str, Any], asset_code: str, downstream: list[str]) -> dict[str, Any]:
+        """把有效范围交给问题追踪，由后者按来源报告幂等地生成派发工单。"""
+        return self._dispatch_impact(report, asset_code, downstream)["issue"]
+
+    def _dispatch_impact(
+        self, report: dict[str, Any], asset_code: str, downstream: list[str]
+    ) -> dict[str, Any]:
+        return _issue_service().receive_impact_dispatch(
+            report,
+            downstream,
+            source=asset_code,
+            severity=str(report.get("严重级别") or "严重"),
+        )
+
+    def dispatch_report(self, report_id: int) -> dict[str, Any] | None:
+        """按报告重新派发（重试入口）：复用来源对应的工单，不新建重复单。"""
+        report = self.get_entry(report_id)
+        if report is None:
+            return None
+        downstream = [d.strip() for d in str(report.get("影响下游") or "").split(",") if d.strip()]
+        return (
+            _issue_service().receive_impact_dispatch(
+                report,
+                downstream,
+                source=str(report.get("变更资产") or ""),
+                severity=str(report.get("严重级别") or "严重"),
+            )
+        )
+
+    def confirm_dispatch(self, report_id: int, confirmed_by: str = "", note: str = "") -> dict[str, Any]:
+        """按报告接收派发确认；迟到或重复的确认只落在来源报告那一侧。"""
+        return _issue_service().confirm_impact_dispatch(
+            report_id, confirmed_by=confirmed_by, note=note
+        )
+
+    def get_dispatch_status(self, report_id: int) -> dict[str, Any]:
+        """查看报告派发与回执状态，重试时可定位尚欠确认的一侧。"""
+        return _issue_service().get_impact_dispatch(report_id)
 
     def get_reports_by_asset(self, asset_code: str) -> list[dict[str, Any]]:
         """获取资产的所有影响报告。"""
